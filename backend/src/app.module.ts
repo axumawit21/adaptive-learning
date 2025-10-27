@@ -6,6 +6,8 @@ import { StudentsModule } from './students/students.module';
 import { ProgressModule } from './progress/progress.module';
 import { ChatModule } from './chat/chat.module';
 import { SummaryModule } from './summary/summary.module';
+import { qdrantProvider } from './common/qdrant.provider';
+import { AppController } from './app.controller';
 
 @Module({
   imports: [
@@ -24,6 +26,10 @@ import { SummaryModule } from './summary/summary.module';
     ProgressModule,
     ChatModule,
     SummaryModule,
+    
   ],
+  providers: [qdrantProvider],
+  controllers: [AppController],
+  exports: [qdrantProvider],
 })
 export class AppModule {}
