@@ -6,6 +6,7 @@ import {
   Get,
   Param,
   Res,
+  Body
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { BooksService } from './books.service';
@@ -29,16 +30,19 @@ export class BooksController {
       }),
     }),
   )
-  async uploadFile(@UploadedFile() file: Express.Multer.File) {
+  async uploadFile(@UploadedFile() file: Express.Multer.File, @Body() body: { subject: string; grade: string }) {
     try {
       if (!file) return { message: '❌ No file uploaded' };
 
       const fileUrl = `http://localhost:3000/books/${file.filename}`;
+      const { subject, grade } = body;
 
       const savedBook = await this.booksService.create({
         title: file.originalname.replace('.pdf', ''),
         filePath: file.path,
         fileUrl,
+        subject,
+        grade,
         uploadedBy: 'admin',
       });
 

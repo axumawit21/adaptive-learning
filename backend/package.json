@@ -26,15 +26,17 @@
     "@nestjs/mongoose": "^11.0.3",
     "@nestjs/platform-express": "^11.1.7",
     "@qdrant/qdrant-js": "^1.15.1",
+    "@types/uuid": "^10.0.0",
     "axios": "^1.12.2",
     "ioredis": "^5.8.2",
     "lodash": "^4.17.21",
     "mongoose": "^8.19.2",
     "multer": "^2.0.2",
-    "pdf-parse": "^2.4.5",
+    "pdf-parse": "^1.1.1",
     "qdrant-client": "^0.0.1",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "uuid": "^13.0.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",

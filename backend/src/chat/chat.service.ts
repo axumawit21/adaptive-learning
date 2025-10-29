@@ -4,22 +4,24 @@ import { Model } from 'mongoose';
 import { InjectModel } from '@nestjs/mongoose';
 import { Book } from '../books/book.schema';
 import { REDIS } from '../common/redis.provider';
+import { QDRANT } from '../common/qdrant.provider';
 import type Redis from 'ioredis';
-import * as fs from 'fs';
-import * as pdfParse from 'pdf-parse';
-import * as _ from 'lodash';
+import type { QdrantClient } from '@qdrant/js-client-rest';
 import axios from 'axios';
 
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
+  private readonly CACHE_TTL = 60 * 60 * 24; // 24 hours
+  private readonly collectionName = process.env.QDRANT_COLLECTION || 'books_chunks';
+
   constructor(
     @InjectModel(Book.name) private bookModel: Model<Book>,
     @Inject(REDIS) private readonly redisClient: Redis,
+    @Inject(QDRANT) private readonly qdrant: QdrantClient,
   ) {}
 
-    private readonly CACHE_TTL = 60 * 60 * 24; // 24 hours
-
+  // 🧠 Normalize + cache helpers
   private normalizeQuestion(question: string): string {
     return question.trim().toLowerCase();
   }
@@ -30,61 +32,57 @@ export class ChatService {
     return cached ? JSON.parse(cached).answer : null;
   }
 
-  private async setCachedAnswer(question: string, data: any, ttl: number = this.CACHE_TTL): Promise<void> {
+  private async setCachedAnswer(
+    question: string,
+    data: any,
+    ttl: number = this.CACHE_TTL,
+  ): Promise<void> {
     const normalized = this.normalizeQuestion(question);
     await this.redisClient.set(`chat:${normalized}`, JSON.stringify(data), 'EX', ttl);
   }
 
-  private chunkText(text: string, chunkSize: number = 1000): string[] {
-    const chunks: string[] = [];
-    for (let i = 0; i < text.length; i += chunkSize) {
-      chunks.push(text.substring(i, i + chunkSize));
-    }
-    return chunks;
+  // ✅ Generate embedding via Ollama (nomic-embed-text)
+  private async getEmbeddingForQuestion(question: string): Promise<number[]> {
+    const res = await axios.post('http://localhost:11434/api/embeddings', {
+      model: 'nomic-embed-text',
+      prompt: question,
+    });
+    return res.data.embedding;
   }
 
-  private async scoreChunk(question: string, chunk: string): Promise<number> {
-    // Simple TF-IDF based scoring
-    const questionTerms = new Set(question.toLowerCase().split(/\s+/));
-    const chunkTerms = chunk.toLowerCase().split(/\s+/);
-    
-    let score = 0;
-    for (const term of questionTerms) {
-      const termCount = chunkTerms.filter(t => t === term).length;
-      score += termCount;
+  // ✅ Retrieve from Qdrant (semantic search)
+  private async retrieveRelevantContexts(question: string, limit = 4): Promise<string[]> {
+    try {
+      const vector = await this.getEmbeddingForQuestion(question);
+
+      const searchResults = await this.qdrant.search(this.collectionName, {
+        vector,
+        limit,
+        with_payload: true,
+      });
+
+      if (!searchResults || searchResults.length === 0) return [];
+
+      const contexts = searchResults
+        .filter((item: any) => item.payload?.text)
+        .map((item: any) => item.payload.text);
+
+      this.logger.log(`🔍 Retrieved ${contexts.length} context chunks from Qdrant`);
+      return contexts;
+    } catch (err) {
+      this.logger.error('❌ Qdrant search error:', err.message);
+      return [];
     }
-    return score / questionTerms.size;
   }
 
-  private async retrieveRelevantContexts(question: string, limit: number = 3): Promise<string[]> {
-    // Get all books from the database
-    const books = await this.bookModel.find().exec();
-    const allChunks: {text: string, score: number}[] = [];
-
-    // Score chunks from all books
-    for (const book of books) {
-      const chunks = this.chunkText(book.content || '');
-      for (const chunk of chunks) {
-        const score = await this.scoreChunk(question, chunk);
-        allChunks.push({ text: chunk, score });
-      }
-    }
-
-    // Sort by score and take top N
-    return allChunks
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(chunk => chunk.text);
-  }
-
+  // ✅ Build LLM prompt
   private buildPrompt(question: string, contexts: string[]): string {
-    const contextText = contexts
-      .map((ctx, i) => `Context ${i + 1}: ${ctx}`)
-      .join('\n\n');
+    const contextText = contexts.map((ctx, i) => `Context ${i + 1}:\n${ctx}`).join('\n---\n');
+    return `You are a helpful AI tutor. Use the provided curriculum context to answer the question.
+If the question is not covered in the context, say: "This topic is not found in your curriculum materials."
+Keep your answer concise and educational.
 
-    return `You are a helpful AI assistant. Use the following context to answer the question at the end.
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
-
+Context:
 ${contextText}
 
 Question: ${question}
@@ -92,55 +90,50 @@ Question: ${question}
 Answer:`;
   }
 
-  // ✨ Mistral 7B (Ollama) version of callLLM
-  async callLLM(prompt: string) {
+  // ✅ Call Mistral (via Ollama)
+  private async callLLM(prompt: string): Promise<string> {
     try {
-      // Ollama runs locally by default on port 11434
       const response = await axios.post('http://localhost:11434/api/generate', {
-        model: 'mistral:latest', // or 'mistral:7b'
+        model: 'mistral',
         prompt,
         stream: false,
       });
-
-      // Ollama returns { response: "text..." }
-      const answer = response.data?.response || 'No response from model';
-      return answer.trim();
+      return response.data?.response?.trim() || 'No response from model';
     } catch (error) {
       this.logger.error('❌ Ollama/Mistral error:', error.message);
-      return `⚠️ Error calling local LLM: ${error.message}`;
+      return `⚠️ Error calling LLM: ${error.message}`;
     }
   }
 
-  // 🧠 Ask function (unchanged, just calls the updated callLLM)
+  // 🧩 Main Ask Function
   async ask(question: string) {
+    // 1️⃣ Check Redis cache
     const cached = await this.getCachedAnswer(question);
     if (cached) return { source: 'cache', answer: cached };
 
+    // 2️⃣ Retrieve semantic contexts
     const contexts = await this.retrieveRelevantContexts(question, 4);
     let answer: string;
 
-   if (contexts.length === 0) {
-    // 🚨 Out of context — explicitly mention this
-    const generalAnswer = await this.callLLM(
-      `The user asked: "${question}". This topic was not found in the uploaded curriculum materials. 
-       Please provide a brief and general educational explanation.`
-    );
+    if (contexts.length === 0) {
+      const generalAnswer = await this.callLLM(
+        `The user asked: "${question}". This topic is not found in the uploaded curriculum materials.
+         Please give a short, general educational explanation.`,
+      );
+      answer = `⚠️ This topic is not found in your curriculum materials.\n\n${generalAnswer}`;
+    } else {
+      const prompt = this.buildPrompt(question, contexts);
+      answer = await this.callLLM(prompt);
+    }
 
-    answer =
-      `⚠️ This topic is not found in your curriculum materials.\n\n` +
-      generalAnswer;
-  } else {
-    const prompt = this.buildPrompt(question, contexts);
-    answer = await this.callLLM(prompt);
+    // 3️⃣ Cache + return
+    const cacheData = { answer, contexts };
+    await this.setCachedAnswer(question, cacheData, this.CACHE_TTL);
+
+    return {
+      source: contexts.length === 0 ? 'general' : 'rag',
+      answer,
+      contexts,
+    };
   }
-
-  const cacheData = { answer, contexts };
-  await this.setCachedAnswer(question, cacheData, 86400);
-
-  return {
-    source: contexts.length === 0 ? 'general' : 'rag',
-    answer,
-    contexts,
-  };
-}
 }

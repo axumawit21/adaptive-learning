@@ -6,6 +6,12 @@ export class Book extends Document {
   @Prop({ required: true })
   title: string;
 
+  @Prop({ required: true })
+grade: string;
+
+@Prop({ required: true })
+subject: string;
+
   @Prop()
   content: string;
 
