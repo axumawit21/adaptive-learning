@@ -130,7 +130,7 @@ async getEmbeddings(texts: string[]): Promise<number[][]> {
     if (!book) throw new Error('Book not found');
     if (!book.filePath) throw new Error('No file path for this book');
 
-    const collectionName = this.getCollectionName(book.grade, book.subject);
+    const collectionName =  `book_${book._id}_chunks`;
 await this.ensureCollection(collectionName);
 
 
