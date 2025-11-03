@@ -26,6 +26,13 @@ subject: string;
 
   @Prop({ default: [] })
   embeddings: number[]; // placeholder for future RAG
+
+   @Prop({ default: [] })
+  summaries: {
+    chapter: string;
+    summary: string;
+    createdAt: Date;
+  }[];
 }
 
 export const BookSchema = SchemaFactory.createForClass(Book);

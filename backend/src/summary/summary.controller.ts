@@ -1,9 +1,19 @@
-import { Controller, Post, Body } from '@nestjs/common';
+import { Body, Controller, Post, Param } from '@nestjs/common';
+import { SummarizeService } from './summary.service';
 
-@Controller('summary')
-export class SummaryController {
-    @Post()
-    summarize(@Body() body: any) {
-        return { message : 'POST /summary generate a summary' , data: body};
+@Controller('summarize')
+export class SummarizeController {
+  constructor(private readonly summarizeService: SummarizeService) {}
+
+  @Post(':bookId')
+  async summarizeChapter(
+    @Param('bookId') bookId: string,
+    @Body('chapter') chapter: string,
+  ) {
+    if (!chapter) {
+      return { message: 'Please provide a "chapter" in the request body' };
     }
+
+    return this.summarizeService.summarizeBook(bookId, chapter);
+  }
 }
