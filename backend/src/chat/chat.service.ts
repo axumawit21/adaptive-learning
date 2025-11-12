@@ -1,38 +1,30 @@
-// src/chat/chat.service.ts
-import { Inject, Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Model } from 'mongoose';
-import axios from 'axios';
-import * as math from 'mathjs';
+import { InjectModel } from '@nestjs/mongoose';
 import { Book } from '../books/book.schema';
 import { REDIS } from '../common/redis.provider';
 import type Redis from 'ioredis';
+import axios from 'axios';
 import { QDRANT } from '../common/qdrant.provider';
 import type { QdrantClient } from '@qdrant/js-client-rest';
 
-// TS types
-interface EmbeddingResponse {
+interface OllamaEmbeddingResponse {
   embedding: number[];
+  [key: string]: any;
 }
 
-interface LLMResponse {
+interface OllamaGenerateResponse {
   response: string;
-}
-
-interface QdrantSearchResult {
-  id: string | number;
-  score: number;
-  payload: {
-    text: string;
-    bookId: string;
-    [key: string]: any;
-  };
+  [key: string]: any;
 }
 
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
-  private readonly CACHE_TTL = 60 * 60 * 24; // 24h
+  private readonly CACHE_TTL = 60 * 60 * 24; // 24 hours
+  private readonly modelName = 'llama3.2:latest';
+  private readonly embeddingModel = 'nomic-embed-text';
+  private readonly MAX_CHUNKS = 4;
 
   constructor(
     @InjectModel(Book.name) private readonly bookModel: Model<Book>,
@@ -40,7 +32,7 @@ export class ChatService {
     @Inject(QDRANT) private readonly qdrant: QdrantClient,
   ) {}
 
-  // --- Cache helpers
+  /** ---------- Helpers ---------- */
   private normalizeQuestion(question: string): string {
     return question.trim().toLowerCase();
   }
@@ -51,111 +43,67 @@ export class ChatService {
     return cached ? JSON.parse(cached).answer : null;
   }
 
-  private async setCachedAnswer(question: string, bookId: string, data: any, ttl = this.CACHE_TTL) {
+  private async setCachedAnswer(question: string, bookId: string, data: any) {
     const key = `chat:${bookId}:${this.normalizeQuestion(question)}`;
-    await this.redisClient.set(key, JSON.stringify(data), 'EX', ttl);
+    await this.redisClient.set(key, JSON.stringify(data), 'EX', this.CACHE_TTL);
   }
 
-  // --- Normalize collection names
-  private getCollectionName(title: string, grade: string, subject: string): string {
-    const cleanTitle = title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 3);
-    const cleanGrade = grade.toLowerCase().replace(/\s+/g, '_');
-    const cleanSubject = subject.toLowerCase().replace(/\s+/g, '_');
-    return `${cleanTitle}_${cleanGrade}_${cleanSubject}`;
+  private getCollectionName(book: Book): string {
+    return `${book.title}_${book.grade}_${book.subject}`
+      .replace(/\s+/g, '_')
+      .replace(/[^\w_]/g, '')
+      .toLowerCase();
   }
 
-  // --- Generate embeddings
-  private async generateEmbedding(text: string): Promise<number[]> {
-    try {
-      this.logger.log('🚀 Generating embedding...');
-      const res = await axios.post<EmbeddingResponse>('http://localhost:11434/api/embeddings', {
-        model: 'nomic-embed-text:latest',
-        prompt: text,
-      });
+  /** ---------- Option C: Extract Unit Title ---------- */
+  private extractUnitTitle(question: string): string | null {
+    const match = question.match(/unit\s*\d+/i);
+    return match ? match[0].trim() : null;
+  }
 
-      if (!res.data?.embedding) throw new Error('No embedding returned');
-      this.logger.log('✅ Embedding generated successfully.');
-      return res.data.embedding;
-    } catch (err: any) {
-      this.logger.error(`❌ Failed to generate embedding: ${err.message}`);
-      throw new Error('Embedding generation failed');
+  /** ---------- Search Relevant Chunks ---------- */
+  private async searchRelevantChunks(question: string, bookId: string, limit = 10): Promise<string[]> {
+    const book = await this.bookModel.findById(bookId);
+    if (!book) throw new Error('Book not found');
+
+    const collectionName = this.getCollectionName(book);
+
+    // Generate embedding
+    const embedResponse = await axios.post<OllamaEmbeddingResponse>('http://localhost:11434/api/embeddings', {
+      model: this.embeddingModel,
+      prompt: question,
+    });
+    const queryVector = embedResponse.data.embedding;
+    if (!queryVector || !Array.isArray(queryVector)) return [];
+
+    // Option C: filter by chapter/unit if query contains a unit
+    const unitTitle = this.extractUnitTitle(question);
+    const filterMust: any[] = [{ key: 'bookId', match: { value: bookId } }];
+    if (unitTitle) {
+      filterMust.push({ key: 'chapterTitle', match: { value: unitTitle } });
     }
+
+    const results = await this.qdrant.search(collectionName, {
+      vector: queryVector,
+      limit,
+      filter: { must: filterMust },
+    });
+
+    if (!results || results.length === 0) return [];
+
+    return results
+      .map((r: any) => r.payload?.text)
+      .filter((t) => t && t.trim().length > 0);
   }
 
-  // --- Call LLM
-  private async callLLM(prompt: string, timeout = 120000): Promise<string> {
-    try {
-      this.logger.log(`💬 Sending prompt (length ${prompt.length}) to Mistral...`);
-      const res = await axios.post<LLMResponse>(
-        'http://localhost:11434/api/generate',
-        { model: 'mistral:latest', prompt, stream: false, max_tokens: 100 },
-        { timeout },
-      );
-
-      if (!res.data?.response) throw new Error('No response from LLM');
-      this.logger.log('✅ Response generated successfully.');
-      return res.data.response.trim();
-    } catch (err: any) {
-      this.logger.error(`❌ Failed to call LLM: ${err.message}`);
-      return `⚠️ Error calling local LLM: ${err.message}`;
-    }
-  }
-
-  // --- Cosine similarity
-  private cosineSimilarity(vecA: number[], vecB: number[]) {
-    const dotProduct = Number(math.dot(vecA, vecB));
-    const normA = Number(math.norm(vecA));
-    const normB = Number(math.norm(vecB));
-    return dotProduct / (normA * normB);
-  }
-
-  // --- Search relevant chunks in Qdrant with score check
-private async searchRelevantChunks(
-  question: string,
-  bookId: string,
-  limit = 4,
-  useFilter = true
-): Promise<{ text: string; score: number }[]> {
-  const book = await this.bookModel.findById(bookId);
-  if (!book) throw new Error('Book not found');
-
-  const collectionName = this.getCollectionName(book.title, book.grade, book.subject);
-  this.logger.log(`🔍 Searching in Qdrant collection: ${collectionName} (limit=${limit})`);
-
-  // Generate embedding
-  const embedRes = await axios.post('http://localhost:11434/api/embeddings', {
-    model: 'nomic-embed-text:latest',
-    prompt: question,
-  }, { timeout: 20000 });
-
-  const queryVector = (embedRes.data as any)?.embedding;
-  if (!queryVector) throw new Error('Embedding generation failed');
-
-  // Build search request
-  const searchRequest: any = { vector: queryVector, limit };
-  if (useFilter) {
-    searchRequest.filter = { must: [{ key: 'bookId', match: { value: bookId } }] };
-  }
-
-  // Perform search
-  const resultsRaw = await this.qdrant.search(collectionName, searchRequest);
-
-  // Map results
-  const results = (resultsRaw as any[]).map(r => ({
-    text: r.payload?.text ?? '',
-    score: r.score ?? 0,
-  }));
-
-  this.logger.log(`🔹 Qdrant returned ${results.length} result(s)`);
-  return results;
-}
-  // --- Build LLM prompt
+  /** ---------- Build Prompt ---------- */
   private buildPrompt(question: string, contexts: string[], bookTitle: string): string {
     const contextText = contexts
-      .map((ctx, i) => `Context ${i + 1}: ${ctx.slice(0, 500)}...`)
+      .slice(0, this.MAX_CHUNKS)
+      .map((ctx, i) => `Context ${i + 1}: ${ctx}`)
       .join('\n\n');
 
-    return `You are an educational AI assistant helping a student studying "${bookTitle}". 
+    return `You are an educational AI assistant helping a student studying "${bookTitle}".
 Use only the provided context to answer accurately.
 If the question is not covered in the context, clearly say it's not in the book and provide a brief general explanation.
 
@@ -166,45 +114,51 @@ Question: ${question}
 Answer:`;
   }
 
-  // --- Main ask function with multiple chunk filtering
-async ask(question: string, bookId: string) {
-  // 1️⃣ Check cache
-  const cached = await this.getCachedAnswer(question, bookId);
-  if (cached) return { source: 'cache', answer: cached, contexts: [] };
-
-  const book = await this.bookModel.findById(bookId);
-  if (!book) throw new InternalServerErrorException('Book not found');
-
-  // 2️⃣ Get top chunks
-  const results = await this.searchRelevantChunks(question, bookId, 2); // get top 5
-  const SIMILARITY_THRESHOLD = 0.7;
-
-  // Filter chunks by threshold
-  const validContexts = results
-    .filter(r => r.score >= SIMILARITY_THRESHOLD)
-    .map(r => r.text);
-
-  let answer: string;
-  let source: 'rag' | 'general';
-
-  if (validContexts.length === 0) {
-    // No relevant chunks → general fallback
-    const generalPrompt = `You are an educational AI assistant helping a student studying "${book.title}". 
-The user asked: "${question}". This topic was not found in the uploaded book. Provide a brief general educational explanation.`;
-
-    answer = await this.callLLM(generalPrompt);
-    source = 'general';
-  } else {
-    // Use RAG context
-    const prompt = this.buildPrompt(question, validContexts, book.title);
-    answer = await this.callLLM(prompt);
-    source = 'rag';
+  /** ---------- Call LLM ---------- */
+  private async callLLM(prompt: string, maxTokens = 512): Promise<string> {
+    try {
+      const response = await axios.post<OllamaGenerateResponse>(
+        'http://localhost:11434/api/generate',
+        { model: this.modelName, prompt, stream: false, max_tokens: maxTokens },
+        { timeout: 120000 },
+      );
+      return response.data.response.trim() || 'No response from model';
+    } catch (error: any) {
+      this.logger.error('❌ Ollama error:', error.response?.data || error.message);
+      return `⚠️ Ollama error: ${error.response?.data?.error || error.message}`;
+    }
   }
 
-  // 3️⃣ Cache result
-  await this.setCachedAnswer(question, bookId, { answer, contexts: validContexts });
+  /** ---------- Main Ask Function ---------- */
+  async ask(question: string, bookId: string) {
+    const cached = await this.getCachedAnswer(question, bookId);
+    if (cached) return { ok: true, source: 'cache', answer: cached };
 
-  // 4️⃣ Return
-  return { source, answer, contexts: validContexts };
-}
+    const book = await this.bookModel.findById(bookId);
+    if (!book) throw new Error('Book not found');
+
+    const allChunks = await this.searchRelevantChunks(question, bookId, 12);
+    const validContexts = allChunks.slice(0, this.MAX_CHUNKS);
+
+    let answer: string;
+    let source: 'rag' | 'general';
+
+    if (validContexts.length === 0) {
+      answer = await this.callLLM(
+        `The user asked: "${question}". This topic was not found in the uploaded book "${book.title}". Provide a short, accurate general educational explanation.`,
+        512,
+      );
+      source = 'general';
+    } else {
+      const prompt = this.buildPrompt(question, validContexts, book.title);
+      answer = await this.callLLM(prompt, 512);
+      source = 'rag';
+    }
+
+    if (!answer.includes('⚠️ Ollama error')) {
+      await this.setCachedAnswer(question, bookId, { answer, contexts: validContexts });
+    }
+
+    return { ok: true, source, answer, contexts: validContexts };
+  }
 }

@@ -8,6 +8,8 @@ import { ChatModule } from './chat/chat.module';
 import { SummarizeModule } from './summary/summary.module';
 import { qdrantProvider } from './common/qdrant.provider';
 import { AppController } from './app.controller';
+import { QuizModule } from './quiz/quiz.module';
+
 
 @Module({
   imports: [
@@ -26,7 +28,7 @@ import { AppController } from './app.controller';
     ProgressModule,
     ChatModule,
     SummarizeModule,
-    
+    QuizModule,
   ],
   providers: [qdrantProvider],
   controllers: [AppController],

@@ -3,6 +3,7 @@ import { Document } from 'mongoose';
 
 @Schema({ timestamps: true })
 export class Book extends Document {
+  
   @Prop({ required: true })
   title: string;
 
@@ -26,13 +27,6 @@ subject: string;
 
   @Prop({ default: [] })
   embeddings: number[]; // placeholder for future RAG
-
-   @Prop({ default: [] })
-  summaries: {
-    chapter: string;
-    summary: string;
-    createdAt: Date;
-  }[];
 }
 
 export const BookSchema = SchemaFactory.createForClass(Book);

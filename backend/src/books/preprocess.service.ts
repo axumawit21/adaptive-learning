@@ -1,4 +1,4 @@
-// src/books/preprocess.service.ts
+
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
@@ -7,17 +7,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import fetch from 'node-fetch';
+import { v4 as uuidv4 } from 'uuid';
 import pdfParse from 'pdf-parse';
+import { bookStructure } from './book-structure';
 
 interface ChapterPayload {
   bookId: string;
-  bookTitle: string;
-  grade: string;
-  subject: string;
-  chapterTitle: string;
-  normalizedChapterTitle: string;
-  chapterIndex: number;
-  subchunkIndex: number;
+  unit: string;
+  subchunk_index: number;
   text: string;
 }
 
@@ -32,14 +29,16 @@ export class PreprocessService {
     });
   }
 
-  /** Main preprocessing */
+  /** Main preprocessing entry */
   async preprocessBook(bookId: string) {
-    const book = await this.bookModel.findById(bookId).lean(true);
+    type BookWithId = Book & { _id: Types.ObjectId };
+    const book = (await this.bookModel.findById(bookId).exec()) as BookWithId;
     if (!book) throw new Error('Book not found');
 
     const fullPath = path.resolve(book.filePath);
     if (!fs.existsSync(fullPath)) throw new Error('File not found on disk');
 
+    // Extract text from PDF or plain text
     let content = '';
     if (fullPath.endsWith('.pdf')) {
       const buffer = fs.readFileSync(fullPath);
@@ -51,65 +50,60 @@ export class PreprocessService {
 
     this.logger.log(`📄 Book content length: ${content.length}`);
 
+    // Extract TOC (Unit only)
     const toc = this.extractTOC(content);
-    this.logger.log(`📖 TOC detected: ${toc.map(t => `Unit ${t.unitNum}: ${t.title}`).join(' | ')}`);
+    this.logger.log(
+      `📖 TOC detected: ${toc.map((t) => `Unit ${t.unitNum}: ${t.title}`).join(' | ')}`
+    );
 
+    // Split units and merge duplicates
     const units = this.splitByUnits(content, toc);
     this.logger.log(`📚 Units found: ${units.length}`);
+    units.forEach((u, i) =>
+      this.logger.log(`Unit ${i + 1}: ${u.title}, length: ${u.text.length}`)
+    );
 
-    const unitChunks = this.subchunkUnits(units);
-    const collectionName = `${book.title}_${book.grade}_${book.subject}`.replace(/\s+/g, '_').replace(/[^\w_]/g, '').toLowerCase();
+    const unitChunks = this.subchunkUnitsByStructure(content, book.title);
+
+    const collectionName = `${book.grade}_${book.subject}`
+      .replace(/\s+/g, '_')
+      .replace(/[^\w_]/g, '')
+      .toLowerCase();
+
     await this.ensureQdrantCollection(collectionName);
 
     let totalPoints = 0;
-    let globalIndex = 1;
 
-    // 1️⃣ Process each unit in parallel batches
-    for (let unitIndex = 0; unitIndex < unitChunks.length; unitIndex++) {
-      const unit = unitChunks[unitIndex];
-      const texts = unit.chunks.map(c => c.text);
+    // Upload subchunks sequentially
+    for (const unit of unitChunks) {
+      const texts = unit.chunks.map((c) => c.text);
+      const embeddings = await this.generateEmbeddings(texts);
 
-      // Parallel embedding generation in batches
-      const batchSize = 20; 
-      const embeddings: number[][] = [];
-      for (let i = 0; i < texts.length; i += batchSize) {
-        const batchTexts = texts.slice(i, i + batchSize);
-        const batchEmbeddings = await Promise.all(batchTexts.map(t => this.generateEmbedding(t)));
-        embeddings.push(...batchEmbeddings);
-      }
-
-      const points = embeddings.map((vector, subIndex) => {
-        const payload: ChapterPayload = {
+      const points = embeddings.map((vector, idx) => ({
+        id: uuidv4(),
+        vector,
+        payload: {
           bookId: book._id.toString(),
-          bookTitle: book.title,
-          grade: book.grade,
-          subject: book.subject,
-          chapterTitle: unit.title,
-          normalizedChapterTitle: unit.title.trim().toLowerCase(),
-          chapterIndex: unitIndex + 1,
-          subchunkIndex: subIndex + 1,
-          text: unit.chunks[subIndex].text,
-        };
-
-        return {
-          id: globalIndex++,
-          vector,
-          payload: payload as unknown as Record<string, unknown>,
-        };
-      });
+          unit: unit.title,
+          subchunk_index: idx,
+          text: unit.chunks[idx].text,
+        } as Record<string, unknown>,
+      }));
 
       await this.qdrant.upsert(collectionName, { points });
       totalPoints += points.length;
 
-      this.logger.log(`✅ Stored ${points.length} subchunks for "${unit.title}" (Unit ${unitIndex + 1})`);
+      this.logger.log(`✅ Stored ${points.length} subchunks for ${unit.title}`);
     }
 
-    this.logger.log(`🎉 Finished preprocessing "${book.title}" (${totalPoints} subchunks total)`);
+    this.logger.log(
+      `🎉 Finished preprocessing "${book.title}" (${totalPoints} subchunks stored)`
+    );
 
     return { message: 'Preprocessing completed successfully', totalPoints };
   }
 
-  /** Extract TOC strictly based on Unit headings */
+  /** Extract TOC strictly based on Unit, normalize titles */
   private extractTOC(content: string): { unitNum: number; title: string }[] {
     const lines = content.split('\n').slice(0, 300);
     const toc: { unitNum: number; title: string }[] = [];
@@ -130,21 +124,23 @@ export class PreprocessService {
     return toc;
   }
 
-  /** Split book content into units based on TOC */
+  /** Split content into units strictly by TOC and merge duplicates */
   private splitByUnits(content: string, toc: { unitNum: number; title: string }[]) {
     const lines = content.split('\n');
     const unitsMap: Map<number, { title: string; text: string }> = new Map();
-    const unitRegex = /^Unit\s*(\d+)\s*[:.\-]?\s*(.+)$/i;
     let currentUnitNum: number | null = null;
+    const unitRegex = /^Unit\s*(\d+)\s*[:.\-]?\s*(.+)$/i;
 
     for (const line of lines) {
       const match = line.trim().match(unitRegex);
       if (match) {
         const unitNum = parseInt(match[1], 10);
-        const tocEntry = toc.find(t => t.unitNum === unitNum);
+        const tocEntry = toc.find((t) => t.unitNum === unitNum);
         if (tocEntry) {
           currentUnitNum = unitNum;
-          if (!unitsMap.has(unitNum)) unitsMap.set(unitNum, { title: tocEntry.title, text: '' });
+          if (!unitsMap.has(unitNum)) {
+            unitsMap.set(unitNum, { title: tocEntry.title, text: '' });
+          }
         } else {
           currentUnitNum = null;
         }
@@ -157,61 +153,79 @@ export class PreprocessService {
     return Array.from(unitsMap.values());
   }
 
-  /** Subchunk units into AI-friendly chunks with overlap */
- /** Subchunk units into AI-friendly chunks with overlap (optimized for Mistral) */
-private subchunkUnits(units: { title: string; text: string }[]) {
-  const maxWords = 200; // ✅ smaller chunks for faster inference
-  const overlap = 50;   // ✅ small overlap for context continuity
-  const unitChunks: { title: string; chunks: { text: string }[] }[] = [];
-  const unitRegex = /^Unit\s*(\d+)\s*[:.\-]?\s*(.+)$/i;
-  const sectionRegex = /^(\d+(\.\d+)+)\s+(.+)$/;
+  /** Split each unit into subchunks */
+  /** Split each unit into AI-friendly subchunks with section headings */
+/** Split content based exactly on bookStructure (unit + subchapters) */
+private subchunkUnitsByStructure(content: string, bookTitle: string) {
+  const maxChars = 500; // target characters per chunk
+  const unitChunks: {
+    title: string;
+    chunks: {
+      text: string;
+      unitTitle: string;
+      subChapterTitle: string | null;
+      pageStart: number;
+      pageEnd: number;
+      chunkIndex: number;
+    }[];
+  }[] = [];
 
-  for (const unit of units) {
-    const lines = unit.text
-      .replace(/\r\n/g, '\n')
-      .split('\n')
-      .map(l => l.trim())
-      .filter(Boolean);
+  // Normalize content lines for approximate paging
+  const lines = content.replace(/\r\n/g, '\n').split('\n').map(l => l.trim());
+  const totalPages = bookStructure[bookStructure.length - 1].pageEnd;
+  const linesPerPage = Math.ceil(lines.length / totalPages);
 
-    const chunks: { text: string }[] = [];
-    let currentChunkWords: string[] = [];
-    let currentHeading = unit.title;
+  // Helper: Extract text from a page range
+  const getTextByPageRange = (startPage: number, endPage: number): string => {
+    const startIdx = (startPage - 1) * linesPerPage;
+    const endIdx = Math.min(endPage * linesPerPage, lines.length);
+    return lines.slice(startIdx, endIdx).join(' ');
+  };
 
-    const pushChunk = () => {
-      if (currentChunkWords.length > 0) {
-        const chunkText = `${currentHeading}\n${currentChunkWords.join(' ')}`.trim();
-        if (chunkText.length > 50) { // skip empty fragments
-          chunks.push({ text: chunkText });
-        }
-        currentChunkWords = [];
+  // Loop through bookStructure
+  for (const unit of bookStructure) {
+    const chunks: {
+      text: string;
+      unitTitle: string;
+      subChapterTitle: string | null;
+      pageStart: number;
+      pageEnd: number;
+      chunkIndex: number;
+    }[] = [];
+
+    // If the unit has subChapters, process each separately
+    if (unit.subChapters && unit.subChapters.length > 0) {
+      for (const sub of unit.subChapters) {
+        const subText = getTextByPageRange(sub.pageStart, sub.pageEnd);
+        const subChunks = this.createFixedSizeChunks(subText, maxChars);
+
+        subChunks.forEach((chunkText, index) => {
+          chunks.push({
+            text: `${unit.title} > ${sub.title}\n${chunkText}`,
+            unitTitle: unit.title,
+            subChapterTitle: sub.title,
+            pageStart: sub.pageStart,
+            pageEnd: sub.pageEnd,
+            chunkIndex: index + 1,
+          });
+        });
       }
-    };
+    } else {
+      // Process entire unit if no subChapters
+      const unitText = getTextByPageRange(unit.pageStart, unit.pageEnd);
+      const unitChunksArray = this.createFixedSizeChunks(unitText, maxChars);
 
-    for (const line of lines) {
-      // Detect new unit or section headings
-      if (line.match(unitRegex)) {
-        pushChunk();
-        currentHeading = line.replace(unitRegex, '$2').trim();
-        continue;
-      }
-
-      const sectionMatch = line.match(sectionRegex);
-      if (sectionMatch) currentHeading = `${sectionMatch[1]} ${sectionMatch[3]}`;
-
-      const words = line.split(/\s+/);
-      // Check if chunk exceeds max size
-      if (currentChunkWords.length + words.length > maxWords && currentChunkWords.length > 0) {
-        pushChunk();
-        // Keep overlap to preserve context
-        currentChunkWords = currentChunkWords.slice(-overlap);
-      }
-
-      currentChunkWords = currentChunkWords.concat(words);
+      unitChunksArray.forEach((chunkText, index) => {
+        chunks.push({
+          text: `${unit.title}\n${chunkText}`,
+          unitTitle: unit.title,
+          subChapterTitle: null,
+          pageStart: unit.pageStart,
+          pageEnd: unit.pageEnd,
+          chunkIndex: index + 1,
+        });
+      });
     }
-
-    pushChunk();
-
-    this.logger.log(`📦 "${unit.title}" → ${chunks.length} chunks (avg ${Math.round(unit.text.split(/\s+/).length / chunks.length)} words per chunk)`);
 
     unitChunks.push({ title: unit.title, chunks });
   }
@@ -219,23 +233,54 @@ private subchunkUnits(units: { title: string; text: string }[]) {
   return unitChunks;
 }
 
-  /** Generate embeddings via Ollama */
-  private async generateEmbedding(text: string) {
-    const res = await fetch(`${process.env.OLLAMA_URL || 'http://localhost:11434'}/api/embeddings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'nomic-embed-text', prompt: text }),
-    });
+/** Helper to create smaller fixed-size text chunks */
+private createFixedSizeChunks(text: string, maxChars: number): string[] {
+  const chunks: string[] = [];
+  let start = 0;
 
-    if (!res.ok) throw new Error(`Ollama embedding error: ${res.status}`);
-    const data = (await res.json()) as { embedding: number[] };
-    return data.embedding;
+  while (start < text.length) {
+    const end = Math.min(start + maxChars, text.length);
+    chunks.push(text.slice(start, end).trim());
+    start = end;
+  }
+
+  return chunks;
+}
+
+
+
+  /** Generate embeddings using Ollama */
+  private async generateEmbeddings(texts: string[]) {
+    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+    const embeddings: number[][] = [];
+
+    for (const text of texts) {
+      const res = await fetch(`${ollamaUrl}/api/embeddings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'nomic-embed-text',
+          prompt: text,
+        }),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Ollama embedding error: ${res.status} - ${errText}`);
+      }
+
+      const data = (await res.json()) as { embedding: number[] };
+      embeddings.push(data.embedding);
+    }
+
+    return embeddings;
   }
 
   /** Ensure Qdrant collection exists */
   private async ensureQdrantCollection(collectionName: string) {
     const collections = await this.qdrant.getCollections();
-    const exists = collections.collections.some(c => c.name === collectionName);
+    const exists = collections.collections.some((c) => c.name === collectionName);
+
     if (!exists) {
       await this.qdrant.createCollection(collectionName, {
         vectors: { size: 768, distance: 'Cosine' },

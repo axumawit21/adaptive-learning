@@ -11,12 +11,12 @@ export class ChatController {
     @Param('bookId') bookId: string,
   ) {
     if (!question || !bookId) {
-      return { message: 'Please provide both "question" and "bookId"' };
+      return { ok: false, message: 'Please provide both "question" and "bookId"' };
     }
 
     try {
-      const res = await this.chatService.ask(question, bookId);
-      return { ok: true, ...res };
+      // Return service response directly (it already includes ok, source, answer, contexts)
+      return await this.chatService.ask(question, bookId);
     } catch (err) {
       return { ok: false, message: 'Error answering question', error: err.message || err };
     }
